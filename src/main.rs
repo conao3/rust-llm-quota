@@ -119,10 +119,30 @@ fn print_json(value: &Value) {
     }
 }
 
+fn expand_home_dir(path: &str) -> PathBuf {
+    if path == "~" {
+        return PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())).join(rest);
+    }
+    PathBuf::from(path)
+}
+
+fn auth_debug_enabled() -> bool {
+    matches!(
+        env::var("LLM_QUOTA_DEBUG_AUTH").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
 fn read_claude_oauth_token() -> Result<String, String> {
     if let Ok(v) = env::var("ANTHROPIC_OAUTH_API_KEY") {
         let token = v.trim().to_string();
         if !token.is_empty() {
+            if auth_debug_enabled() {
+                eprintln!("[llm-quota] claude auth source: ANTHROPIC_OAUTH_API_KEY");
+            }
             return Ok(token);
         }
     }
@@ -131,7 +151,7 @@ fn read_claude_oauth_token() -> Result<String, String> {
     if let Ok(config_dir) = env::var("CLAUDE_CONFIG_DIR") {
         let dir = config_dir.trim();
         if !dir.is_empty() {
-            let base = PathBuf::from(dir);
+            let base = expand_home_dir(dir);
             candidates.push(base.join(".credentials.json"));
         }
     }
@@ -147,6 +167,9 @@ fn read_claude_oauth_token() -> Result<String, String> {
             "ANTHROPIC_OAUTH_API_KEY is not set and Claude credentials file was not found (checked CLAUDE_CONFIG_DIR and ~/.claude/.credentials.json)"
                 .to_string()
         })?;
+    if auth_debug_enabled() {
+        eprintln!("[llm-quota] claude auth source: {}", credentials_path.display());
+    }
 
     let content = fs::read_to_string(&credentials_path)
         .map_err(|e| format!("failed to read {}: {e}", credentials_path.display()))?;
@@ -308,6 +331,9 @@ fn read_codex_auth() -> Result<(String, String), String> {
     if let Ok(access_token) = env::var("OPENAI_OAUTH_API_KEY") {
         let access_token = access_token.trim().to_string();
         if !access_token.is_empty() {
+            if auth_debug_enabled() {
+                eprintln!("[llm-quota] codex auth source: OPENAI_OAUTH_API_KEY");
+            }
             let account_id = env::var("OPENAI_ACCOUNT_ID")
                 .or_else(|_| env::var("CHATGPT_ACCOUNT_ID"))
                 .map_err(|_| {
@@ -331,7 +357,7 @@ fn read_codex_auth() -> Result<(String, String), String> {
             PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
                 .join(".codex/auth.json")
         } else {
-            PathBuf::from(codex_home).join("auth.json")
+            expand_home_dir(codex_home).join("auth.json")
         }
     } else {
         PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
@@ -340,6 +366,9 @@ fn read_codex_auth() -> Result<(String, String), String> {
 
     let content = fs::read_to_string(&auth_path)
         .map_err(|e| format!("failed to read auth file {}: {e}", auth_path.display()))?;
+    if auth_debug_enabled() {
+        eprintln!("[llm-quota] codex auth source: {}", auth_path.display());
+    }
     let auth: CodexAuthFile = serde_json::from_str(&content)
         .map_err(|e| format!("failed to parse auth file {}: {e}", auth_path.display()))?;
 
