@@ -168,7 +168,10 @@ fn read_claude_oauth_token() -> Result<String, String> {
                 .to_string()
         })?;
     if auth_debug_enabled() {
-        eprintln!("[llm-quota] claude auth source: {}", credentials_path.display());
+        eprintln!(
+            "[llm-quota] claude auth source: {}",
+            credentials_path.display()
+        );
     }
 
     let content = fs::read_to_string(&credentials_path)
