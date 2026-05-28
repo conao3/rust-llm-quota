@@ -31,6 +31,23 @@
             cargo = prev.cargo;
             clippy = prev.clippy;
             rustfmt = prev.rustfmt;
+            fetchurl =
+              args:
+              prev.fetchurl (
+                if args ? url then
+                  let
+                    m = builtins.match "https://crates\\.io/api/v1/crates/([^/]+)/([^/]+)/download" args.url;
+                  in
+                  if m == null then
+                    args
+                  else
+                    args
+                    // {
+                      url = "https://static.crates.io/crates/${builtins.elemAt m 0}/${builtins.elemAt m 0}-${builtins.elemAt m 1}.crate";
+                    }
+                else
+                  args
+              );
           };
           pkgs = import inputs.nixpkgs {
             inherit system;
