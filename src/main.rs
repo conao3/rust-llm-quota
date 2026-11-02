@@ -1,28 +1,63 @@
-use clap::{Parser, Subcommand};
+mod error;
+mod grammar;
+mod output;
+
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use error::{Result, other, parameter, target};
+use grammar::{CliInputArgs, SkeletonKind};
 use opentelemetry::trace::{Span, TraceContextExt, Tracer, get_active_span};
 use opentelemetry::{Context, KeyValue, global};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use output::{OutputFormat, Response};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-#[derive(Parser, Debug)]
-#[command(name = "llm-quota")]
-#[command(about = "Usage limit utilities", long_about = None)]
+static DEBUG: AtomicBool = AtomicBool::new(false);
+
+#[derive(Parser)]
+#[command(
+    name = "llm-quota",
+    version,
+    about = "Fetch Claude and Codex usage limits"
+)]
 struct Cli {
+    /// Output format
+    #[arg(long, global = true, help_heading = "Global Options", value_enum, default_value_t = OutputFormat::Json)]
+    output: OutputFormat,
+    /// JMESPath expression applied to the output
+    #[arg(
+        long,
+        global = true,
+        help_heading = "Global Options",
+        value_name = "JMESPATH"
+    )]
+    query: Option<String>,
+    /// Print the credential source and the raw response body to stderr
+    #[arg(long, global = true, help_heading = "Global Options")]
+    debug: bool,
     #[command(subcommand)]
-    command: Commands,
+    command: Command,
 }
 
-#[derive(Subcommand, Debug)]
-enum Commands {
-    /// Fetch Claude OAuth usage limits and print JSON output
-    #[command(after_help = "\
+#[derive(Subcommand)]
+enum Command {
+    /// Fetch the usage limits of an LLM subscription
+    #[command(subcommand)]
+    Usage(UsageCommand),
+}
+
+#[derive(Subcommand)]
+enum UsageCommand {
+    /// Fetch the Claude OAuth usage limits
+    #[command(
+        name = "get-claude-usage",
+        after_help = "\
 Environment Variables:
   ANTHROPIC_OAUTH_API_KEY  OAuth access token (overrides ~/.claude/.credentials.json)
   CLAUDE_CONFIG_DIR        Claude config directory (uses $CLAUDE_CONFIG_DIR/.credentials.json)
@@ -30,10 +65,13 @@ Environment Variables:
 
   OTEL_EXPORTER_OTLP_ENDPOINT  OTLP endpoint (enables tracing when set)
   OTEL_EXPORTER_OTLP_PROTOCOL  http/protobuf or grpc [default: grpc]
-  OTEL_EXPORTER_OTLP_HEADERS   Auth headers (e.g. Authorization=Basic ...)")]
-    Claude,
-    /// Fetch Codex usage limits and print JSON output
-    #[command(after_help = "\
+  OTEL_EXPORTER_OTLP_HEADERS   Auth headers (e.g. Authorization=Basic ...)"
+    )]
+    GetClaudeUsage(NoArgs),
+    /// Fetch the Codex usage limits
+    #[command(
+        name = "get-codex-usage",
+        after_help = "\
 Environment Variables:
   OPENAI_OAUTH_API_KEY   OAuth access token (overrides ~/.codex/auth.json)
   CODEX_HOME             Codex config directory (uses $CODEX_HOME/auth.json)
@@ -43,8 +81,15 @@ Environment Variables:
 
   OTEL_EXPORTER_OTLP_ENDPOINT  OTLP endpoint (enables tracing when set)
   OTEL_EXPORTER_OTLP_PROTOCOL  http/protobuf or grpc [default: grpc]
-  OTEL_EXPORTER_OTLP_HEADERS   Auth headers (e.g. Authorization=Basic ...)")]
-    Codex,
+  OTEL_EXPORTER_OTLP_HEADERS   Auth headers (e.g. Authorization=Basic ...)"
+    )]
+    GetCodexUsage(NoArgs),
+}
+
+#[derive(Args)]
+struct NoArgs {
+    #[command(flatten)]
+    input: CliInputArgs,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -112,13 +157,6 @@ fn left(v: Option<f64>) -> Option<f64> {
     v.map(|n| (100.0 - n).max(0.0))
 }
 
-fn print_json(value: &Value) {
-    match serde_json::to_string_pretty(value) {
-        Ok(s) => println!("{s}"),
-        Err(_) => println!("{{\"ok\":false,\"error\":\"failed to serialize output\"}}"),
-    }
-}
-
 fn expand_home_dir(path: &str) -> PathBuf {
     if path == "~" {
         return PathBuf::from(env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
@@ -130,18 +168,15 @@ fn expand_home_dir(path: &str) -> PathBuf {
 }
 
 fn auth_debug_enabled() -> bool {
-    matches!(
-        env::var("LLM_QUOTA_DEBUG_AUTH").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
-    )
+    DEBUG.load(Ordering::Relaxed)
 }
 
-fn read_claude_oauth_token() -> Result<String, String> {
+fn read_claude_oauth_token() -> std::result::Result<String, String> {
     if let Ok(v) = env::var("ANTHROPIC_OAUTH_API_KEY") {
         let token = v.trim().to_string();
         if !token.is_empty() {
             if auth_debug_enabled() {
-                eprintln!("[llm-quota] claude auth source: ANTHROPIC_OAUTH_API_KEY");
+                eprintln!("debug: claude auth source: ANTHROPIC_OAUTH_API_KEY");
             }
             return Ok(token);
         }
@@ -168,10 +203,7 @@ fn read_claude_oauth_token() -> Result<String, String> {
                 .to_string()
         })?;
     if auth_debug_enabled() {
-        eprintln!(
-            "[llm-quota] claude auth source: {}",
-            credentials_path.display()
-        );
+        eprintln!("debug: claude auth source: {}", credentials_path.display());
     }
 
     let content = fs::read_to_string(&credentials_path)
@@ -192,150 +224,12 @@ fn read_claude_oauth_token() -> Result<String, String> {
         })
 }
 
-async fn run_claude() -> ExitCode {
-    let tracer = global::tracer("llm-quota");
-    let _root_guard = Context::current_with_span(tracer.start("run_claude")).attach();
-
-    let base_url =
-        env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| "https://api.anthropic.com".to_string());
-
-    let api_key = {
-        let _auth_guard = Context::current_with_span(tracer.start("resolve_auth")).attach();
-        match read_claude_oauth_token() {
-            Ok(v) => v,
-            Err(e) => {
-                print_json(&json!({"ok": false, "error": e}));
-                return ExitCode::from(2);
-            }
-        }
-    };
-
-    let url = format!("{}/api/oauth/usage", base_url.trim_end_matches('/'));
-
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            print_json(&json!({"ok": false, "error": format!("failed to build HTTP client: {e}")}));
-            return ExitCode::from(1);
-        }
-    };
-
-    let mut http_span = tracer.start("http_request");
-    http_span.set_attribute(KeyValue::new("http.request.method", "GET"));
-    http_span.set_attribute(KeyValue::new("url.full", url.clone()));
-
-    let response = match client
-        .get(url)
-        .header(ACCEPT, "application/json, text/plain, */*")
-        .header(CONTENT_TYPE, "application/json")
-        .header(USER_AGENT, "claude-code/2.0.32")
-        .header(AUTHORIZATION, format!("Bearer {api_key}"))
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            print_json(&json!({"ok": false, "error": format!("request failed: {e}")}));
-            return ExitCode::from(1);
-        }
-    };
-
-    let status = response.status();
-    http_span.set_attribute(KeyValue::new(
-        "http.response.status_code",
-        status.as_u16() as i64,
-    ));
-    let body_text = match response.text().await {
-        Ok(t) => t,
-        Err(e) => {
-            print_json(
-                &json!({"ok": false, "error": format!("failed to read response body: {e}")}),
-            );
-            return ExitCode::from(1);
-        }
-    };
-    http_span.add_event(
-        "http.response.body",
-        vec![KeyValue::new("body", body_text.clone())],
-    );
-    drop(http_span);
-
-    if !status.is_success() {
-        print_json(&json!({
-            "ok": false,
-            "error": format!("HTTP {}", status.as_u16()),
-            "response_body": body_text,
-        }));
-        return ExitCode::from(1);
-    }
-
-    let usage_value: Value = match serde_json::from_str(&body_text) {
-        Ok(v) => v,
-        Err(e) => {
-            print_json(&json!({"ok": false, "error": format!("failed to parse JSON: {e}")}));
-            return ExitCode::from(1);
-        }
-    };
-
-    let usage: OAuthUsageResponse =
-        serde_json::from_value(usage_value.clone()).unwrap_or(OAuthUsageResponse {
-            five_hour: None,
-            seven_day: None,
-            seven_day_sonnet: None,
-        });
-
-    let mut summary: Map<String, Value> = Map::new();
-    summary.insert(
-        "five_hour".to_string(),
-        json!({
-            "resets_at": usage.five_hour.as_ref().and_then(|w| w.resets_at.clone()),
-            "percent_left": left(usage.five_hour.as_ref().and_then(|w| w.utilization)),
-        }),
-    );
-    summary.insert(
-        "seven_day".to_string(),
-        json!({
-            "resets_at": usage.seven_day.as_ref().and_then(|w| w.resets_at.clone()),
-            "percent_left": left(usage.seven_day.as_ref().and_then(|w| w.utilization)),
-        }),
-    );
-    summary.insert(
-        "seven_day_sonnet".to_string(),
-        json!({
-            "resets_at": usage.seven_day_sonnet.as_ref().and_then(|w| w.resets_at.clone()),
-            "percent_left": left(usage.seven_day_sonnet.as_ref().and_then(|w| w.utilization)),
-        }),
-    );
-
-    let out = json!({
-        "ok": true,
-        "usage": usage_value,
-        "summary": summary,
-    });
-    get_active_span(|span| {
-        span.add_event(
-            "output",
-            vec![KeyValue::new(
-                "json",
-                serde_json::to_string(&out).unwrap_or_default(),
-            )],
-        );
-    });
-
-    print_json(&out);
-    ExitCode::SUCCESS
-}
-
-fn read_codex_auth() -> Result<(String, String), String> {
+fn read_codex_auth() -> std::result::Result<(String, String), String> {
     if let Ok(access_token) = env::var("OPENAI_OAUTH_API_KEY") {
         let access_token = access_token.trim().to_string();
         if !access_token.is_empty() {
             if auth_debug_enabled() {
-                eprintln!("[llm-quota] codex auth source: OPENAI_OAUTH_API_KEY");
+                eprintln!("debug: codex auth source: OPENAI_OAUTH_API_KEY");
             }
             let account_id = env::var("OPENAI_ACCOUNT_ID")
                 .or_else(|_| env::var("CHATGPT_ACCOUNT_ID"))
@@ -370,7 +264,7 @@ fn read_codex_auth() -> Result<(String, String), String> {
     let content = fs::read_to_string(&auth_path)
         .map_err(|e| format!("failed to read auth file {}: {e}", auth_path.display()))?;
     if auth_debug_enabled() {
-        eprintln!("[llm-quota] codex auth source: {}", auth_path.display());
+        eprintln!("debug: codex auth source: {}", auth_path.display());
     }
     let auth: CodexAuthFile = serde_json::from_str(&content)
         .map_err(|e| format!("failed to parse auth file {}: {e}", auth_path.display()))?;
@@ -390,139 +284,350 @@ fn read_codex_auth() -> Result<(String, String), String> {
     Ok((access_token, account_id))
 }
 
-async fn run_codex() -> ExitCode {
-    let tracer = global::tracer("llm-quota");
-    let _root_guard = Context::current_with_span(tracer.start("run_codex")).attach();
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ClaudeWindowSummary {
+    resets_at: Option<String>,
+    percent_left: Option<f64>,
+}
 
-    let (access_token, account_id) = {
-        let _auth_guard = Context::current_with_span(tracer.start("resolve_auth")).attach();
-        match read_codex_auth() {
-            Ok(v) => v,
-            Err(e) => {
-                print_json(&json!({"ok": false, "error": e}));
-                return ExitCode::from(2);
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ClaudeSummary {
+    five_hour: ClaudeWindowSummary,
+    seven_day: ClaudeWindowSummary,
+    seven_day_sonnet: ClaudeWindowSummary,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct UsageOutput<T> {
+    usage: Value,
+    summary: T,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct CodexSummary {
+    five_hour: Value,
+    seven_day: Value,
+}
+
+fn to_value<T: Serialize>(value: &T) -> Result<Value> {
+    serde_json::to_value(value).map_err(|error| other(error.to_string()))
+}
+
+fn pascal_case_key(key: &str) -> String {
+    key.split(['_', '-'])
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+                None => String::new(),
             }
-        }
-    };
+        })
+        .collect()
+}
 
-    let base_url =
-        env::var("CHATGPT_BASE_URL").unwrap_or_else(|_| "https://chatgpt.com".to_string());
-    let url = format!("{}/backend-api/wham/usage", base_url.trim_end_matches('/'));
+fn pascal_case_keys(value: Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (pascal_case_key(&key), pascal_case_keys(value)))
+                .collect::<Map<_, _>>(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(pascal_case_keys).collect()),
+        value => value,
+    }
+}
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            print_json(&json!({"ok": false, "error": format!("failed to build HTTP client: {e}")}));
-            return ExitCode::from(1);
-        }
-    };
+fn claude_window_summary(window: Option<&UsageWindow>) -> ClaudeWindowSummary {
+    ClaudeWindowSummary {
+        resets_at: window.and_then(|w| w.resets_at.clone()),
+        percent_left: left(window.and_then(|w| w.utilization)),
+    }
+}
 
+async fn fetch_usage(request: reqwest::RequestBuilder, url: &str) -> Result<Value> {
+    let tracer = global::tracer("llm-quota");
     let mut http_span = tracer.start("http_request");
     http_span.set_attribute(KeyValue::new("http.request.method", "GET"));
-    http_span.set_attribute(KeyValue::new("url.full", url.clone()));
+    http_span.set_attribute(KeyValue::new("url.full", url.to_string()));
 
-    let response = match client
-        .get(url)
-        .header(ACCEPT, "application/json")
-        .header(CONTENT_TYPE, "application/json")
-        .header(USER_AGENT, "codex-cli")
-        .header(AUTHORIZATION, format!("Bearer {access_token}"))
-        .header("ChatGPT-Account-Id", account_id)
+    let response = request
         .send()
         .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            print_json(&json!({"ok": false, "error": format!("request failed: {e}")}));
-            return ExitCode::from(1);
-        }
-    };
+        .map_err(|e| target(format!("request failed: {e}")))?;
 
     let status = response.status();
     http_span.set_attribute(KeyValue::new(
         "http.response.status_code",
         status.as_u16() as i64,
     ));
-    let body_text = match response.text().await {
-        Ok(t) => t,
-        Err(e) => {
-            print_json(
-                &json!({"ok": false, "error": format!("failed to read response body: {e}")}),
-            );
-            return ExitCode::from(1);
-        }
-    };
+    let body_text = response
+        .text()
+        .await
+        .map_err(|e| target(format!("failed to read response body: {e}")))?;
     http_span.add_event(
         "http.response.body",
         vec![KeyValue::new("body", body_text.clone())],
     );
     drop(http_span);
-
-    if !status.is_success() {
-        print_json(&json!({
-            "ok": false,
-            "error": format!("HTTP {}", status.as_u16()),
-            "response_body": body_text,
-        }));
-        return ExitCode::from(1);
+    if auth_debug_enabled() {
+        eprintln!("debug: response body: {body_text}");
     }
 
-    let usage_value: Value = match serde_json::from_str(&body_text) {
-        Ok(v) => v,
-        Err(e) => {
-            print_json(&json!({"ok": false, "error": format!("failed to parse JSON: {e}")}));
-            return ExitCode::from(1);
-        }
-    };
+    if !status.is_success() {
+        return Err(target(format!("HTTP {}: {body_text}", status.as_u16())));
+    }
 
-    let primary = usage_value
-        .get("rate_limit")
-        .and_then(|v| v.get("primary_window"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    let secondary = usage_value
-        .get("rate_limit")
-        .and_then(|v| v.get("secondary_window"))
-        .cloned()
-        .unwrap_or(Value::Null);
+    serde_json::from_str(&body_text).map_err(|e| target(format!("failed to parse JSON: {e}")))
+}
 
-    let out = json!({
-        "ok": true,
-        "usage": usage_value,
-        "summary": {
-            "five_hour": primary,
-            "seven_day": secondary
-        }
-    });
+fn http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| other(format!("failed to build HTTP client: {e}")))
+}
+
+fn record_output(out: &Value) {
     get_active_span(|span| {
         span.add_event(
             "output",
             vec![KeyValue::new(
                 "json",
-                serde_json::to_string(&out).unwrap_or_default(),
+                serde_json::to_string(out).unwrap_or_default(),
             )],
         );
     });
+}
 
-    print_json(&out);
-    ExitCode::SUCCESS
+async fn get_claude_usage() -> Result<Value> {
+    let tracer = global::tracer("llm-quota");
+    let _root_guard = Context::current_with_span(tracer.start("run_claude")).attach();
+
+    let base_url =
+        env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+
+    let api_key = {
+        let _auth_guard = Context::current_with_span(tracer.start("resolve_auth")).attach();
+        read_claude_oauth_token().map_err(other)?
+    };
+
+    let url = format!("{}/api/oauth/usage", base_url.trim_end_matches('/'));
+    let request = http_client()?
+        .get(&url)
+        .header(ACCEPT, "application/json, text/plain, */*")
+        .header(CONTENT_TYPE, "application/json")
+        .header(USER_AGENT, "claude-code/2.0.32")
+        .header(AUTHORIZATION, format!("Bearer {api_key}"))
+        .header("anthropic-beta", "oauth-2025-04-20");
+    let usage_value = fetch_usage(request, &url).await?;
+
+    let usage: OAuthUsageResponse =
+        serde_json::from_value(usage_value.clone()).unwrap_or(OAuthUsageResponse {
+            five_hour: None,
+            seven_day: None,
+            seven_day_sonnet: None,
+        });
+
+    let out = to_value(&UsageOutput {
+        usage: pascal_case_keys(usage_value),
+        summary: ClaudeSummary {
+            five_hour: claude_window_summary(usage.five_hour.as_ref()),
+            seven_day: claude_window_summary(usage.seven_day.as_ref()),
+            seven_day_sonnet: claude_window_summary(usage.seven_day_sonnet.as_ref()),
+        },
+    })?;
+    record_output(&out);
+    Ok(out)
+}
+
+async fn get_codex_usage() -> Result<Value> {
+    let tracer = global::tracer("llm-quota");
+    let _root_guard = Context::current_with_span(tracer.start("run_codex")).attach();
+
+    let (access_token, account_id) = {
+        let _auth_guard = Context::current_with_span(tracer.start("resolve_auth")).attach();
+        read_codex_auth().map_err(other)?
+    };
+
+    let base_url =
+        env::var("CHATGPT_BASE_URL").unwrap_or_else(|_| "https://chatgpt.com".to_string());
+    let url = format!("{}/backend-api/wham/usage", base_url.trim_end_matches('/'));
+    let request = http_client()?
+        .get(&url)
+        .header(ACCEPT, "application/json")
+        .header(CONTENT_TYPE, "application/json")
+        .header(USER_AGENT, "codex-cli")
+        .header(AUTHORIZATION, format!("Bearer {access_token}"))
+        .header("ChatGPT-Account-Id", account_id);
+    let usage_value = pascal_case_keys(fetch_usage(request, &url).await?);
+
+    let window = |name: &str| {
+        usage_value
+            .get("RateLimit")
+            .and_then(|v| v.get(name))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let summary = CodexSummary {
+        five_hour: window("PrimaryWindow"),
+        seven_day: window("SecondaryWindow"),
+    };
+    let out = to_value(&UsageOutput {
+        usage: usage_value.clone(),
+        summary,
+    })?;
+    record_output(&out);
+    Ok(out)
+}
+
+fn output_skeleton(path: &[String]) -> Result<Value> {
+    let codex_window = || {
+        json!({
+            "LimitWindowSeconds": 0,
+            "ResetAfterSeconds": 0,
+            "ResetAt": 0,
+            "UsedPercent": 0
+        })
+    };
+    let claude_window = || ClaudeWindowSummary {
+        resets_at: Some(String::new()),
+        percent_left: Some(0.0),
+    };
+    match path.last().map(String::as_str) {
+        Some("get-claude-usage") => to_value(&UsageOutput {
+            usage: json!({}),
+            summary: ClaudeSummary {
+                five_hour: claude_window(),
+                seven_day: claude_window(),
+                seven_day_sonnet: claude_window(),
+            },
+        }),
+        Some("get-codex-usage") => to_value(&UsageOutput {
+            usage: json!({}),
+            summary: CodexSummary {
+                five_hour: codex_window(),
+                seven_day: codex_window(),
+            },
+        }),
+        _ => Err(parameter(
+            "--generate-cli-skeleton needs a command and a subcommand",
+        )),
+    }
+}
+
+async fn run() -> Result<()> {
+    let mut root = Cli::command();
+    root.build();
+    let prepared = grammar::prepare(&root, env::args_os().collect())?;
+    if prepared.argv.iter().any(|token| token == "--debug") {
+        DEBUG.store(true, Ordering::Relaxed);
+        eprintln!("debug: argv {:?}", &prepared.argv[1..]);
+    }
+
+    if let Some(kind) = prepared.skeleton {
+        let mut command = &root;
+        for name in &prepared.path {
+            command = command
+                .find_subcommand(name)
+                .ok_or_else(|| other(format!("unknown subcommand {name}")))?;
+        }
+        if command.has_subcommands() {
+            return Err(parameter(
+                "--generate-cli-skeleton needs a command and a subcommand",
+            ));
+        }
+        let value = match kind {
+            SkeletonKind::Input => grammar::input_skeleton(command),
+            SkeletonKind::Output => output_skeleton(&prepared.path)?,
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(|error| other(error.to_string()))?
+        );
+        return Ok(());
+    }
+
+    let cli = match Cli::try_parse_from(&prepared.argv) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let code = if error.use_stderr() { 252 } else { 0 };
+            let _ = error.print();
+            std::process::exit(code);
+        }
+    };
+
+    if let Some(query) = &cli.query {
+        output::compile_query(query)?;
+    }
+    let Command::Usage(command) = cli.command;
+    let (name, value) = match command {
+        UsageCommand::GetClaudeUsage(_) => ("get-claude-usage", get_claude_usage().await?),
+        UsageCommand::GetCodexUsage(_) => ("get-codex-usage", get_codex_usage().await?),
+    };
+    print!(
+        "{}",
+        output::render(
+            &grammar::pascal_case(name),
+            Response { value, text: None },
+            cli.output,
+            cli.query.as_deref()
+        )?
+    );
+    Ok(())
+}
+
+fn report(result: Result<()>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("error: {error}");
+            error.exit_code()
+        }
+    }
 }
 
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn main() {
     let provider = init_tracer_provider();
     if let Some(ref p) = provider {
         global::set_tracer_provider(p.clone());
     }
-    let exit_code = match Cli::parse().command {
-        Commands::Claude => run_claude().await,
-        Commands::Codex => run_codex().await,
-    };
+    let code = report(run().await);
     if let Some(p) = provider {
         let _ = p.shutdown();
     }
-    exit_code
+    std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parser_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn converts_response_keys_to_pascal_case() {
+        let value = json!({"rate_limit": {"primary_window": {"used_percent": 3}}, "approx_local_messages": [0, 0]});
+        assert_eq!(
+            pascal_case_keys(value),
+            json!({"RateLimit": {"PrimaryWindow": {"UsedPercent": 3}}, "ApproxLocalMessages": [0, 0]})
+        );
+    }
+
+    #[test]
+    fn claude_summary_reports_the_percent_left() {
+        let window = UsageWindow {
+            utilization: Some(4.0),
+            resets_at: Some("t".to_string()),
+        };
+        let summary = to_value(&claude_window_summary(Some(&window))).unwrap();
+        assert_eq!(summary, json!({"ResetsAt": "t", "PercentLeft": 96.0}));
+    }
 }

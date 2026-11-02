@@ -4,9 +4,9 @@ A CLI tool that fetches usage-limit information for Claude and Codex and prints 
 
 ## Features
 
-- Fetch Claude OAuth usage with the `claude` subcommand
-- Fetch Codex usage with the `codex` subcommand
-- Print structured JSON with `ok`, `usage`, and `summary`
+- Fetch Claude OAuth usage with `usage get-claude-usage`
+- Fetch Codex usage with `usage get-codex-usage`
+- Print the raw API response under `Usage` and a normalized window summary under `Summary`
 
 ## Requirements
 
@@ -17,14 +17,25 @@ A CLI tool that fetches usage-limit information for Claude and Codex and prints 
 
 ```bash
 # Show CLI help
-nix run .#default -- --help
+nix run .#default -- help
 
 # Fetch Claude usage
-nix run .#default -- claude
+nix run .#default -- usage get-claude-usage
 
 # Fetch Codex usage
-nix run .#default -- codex
+nix run .#default -- usage get-codex-usage
+
+# Print only the percentage left in the seven-day window
+nix run .#default -- usage get-claude-usage --query Summary.SevenDay.PercentLeft --output text
 ```
+
+## Command line
+
+Commands follow the AWS CLI grammar: `llm-quota [global options] <command> <subcommand> [--parameter value ...]`.
+
+- Global options: `--output json|text|table` (default `json`), `--query <JMESPath>`, `--debug` (prints the credential source and the raw response body to stderr), `--version`.
+- `help` works at every level: `llm-quota help`, `llm-quota usage help`, `llm-quota usage get-claude-usage help`.
+- Every subcommand accepts `--cli-input-json` (a JSON object keyed by PascalCase parameter names) and `--generate-cli-skeleton input|output`. The usage subcommands take no parameters; credentials and endpoints come from the environment variables below.
 
 ## Authentication resolution order
 
@@ -43,7 +54,7 @@ Example
 
 ```bash
 ANTHROPIC_OAUTH_API_KEY=your_token \
-  nix run .#default -- claude
+  nix run .#default -- usage get-claude-usage
 ```
 
 ### Codex
@@ -61,145 +72,110 @@ Example
 ```bash
 OPENAI_OAUTH_API_KEY=your_token \
 OPENAI_ACCOUNT_ID=your_account_id \
-  nix run .#default -- codex
+  nix run .#default -- usage get-codex-usage
 ```
 
 ## Output
 
-On success
+Output keys are PascalCase. The raw API response is returned under `Usage` with its keys converted to PascalCase (`rate_limit.primary_window` becomes `RateLimit.PrimaryWindow`).
 
-- `ok: true`
-- `usage`: raw API response
-- `summary`: normalized window summary
+- `Usage`: raw API response
+- `Summary`: normalized window summary
 
-On failure
+Errors are printed to stderr as `error: <message>`; for a non-success HTTP response the message contains the status and the response body.
 
-- `ok: false`
-- `error`
-- `response_body` for non-success HTTP responses
-
-### Example output (redacted)
+### Example output for `get-claude-usage` (redacted)
 
 ```json
 {
-  "ok": true,
-  "summary": {
-    "five_hour": {
-      "percent_left": 96.0,
-      "resets_at": "<redacted-timestamp>"
+  "Usage": {
+    "FiveHour": {
+      "Utilization": 4.0,
+      "ResetsAt": "<redacted-timestamp>"
     },
-    "seven_day": {
-      "percent_left": 100.0,
-      "resets_at": "<redacted-timestamp>"
+    "SevenDay": {
+      "Utilization": 0.0,
+      "ResetsAt": "<redacted-timestamp>"
     },
-    "seven_day_sonnet": {
-      "percent_left": 100.0,
-      "resets_at": "<redacted-timestamp>"
+    "SevenDaySonnet": {
+      "Utilization": 0.0,
+      "ResetsAt": "<redacted-timestamp>"
+    },
+    "ExtraUsage": {
+      "IsEnabled": false,
+      "MonthlyLimit": null,
+      "UsedCredits": null,
+      "Utilization": null
     }
   },
-  "usage": {
-    "extra_usage": {
-      "is_enabled": false,
-      "monthly_limit": null,
-      "used_credits": null,
-      "utilization": null
+  "Summary": {
+    "FiveHour": {
+      "ResetsAt": "<redacted-timestamp>",
+      "PercentLeft": 96.0
     },
-    "five_hour": {
-      "resets_at": "<redacted-timestamp>",
-      "utilization": 4.0
+    "SevenDay": {
+      "ResetsAt": "<redacted-timestamp>",
+      "PercentLeft": 100.0
     },
-    "iguana_necktie": null,
-    "seven_day": {
-      "resets_at": "<redacted-timestamp>",
-      "utilization": 0.0
-    },
-    "seven_day_cowork": null,
-    "seven_day_oauth_apps": null,
-    "seven_day_opus": null,
-    "seven_day_sonnet": {
-      "resets_at": "<redacted-timestamp>",
-      "utilization": 0.0
+    "SevenDaySonnet": {
+      "ResetsAt": "<redacted-timestamp>",
+      "PercentLeft": 100.0
     }
   }
 }
 ```
 
-### Example output for `codex` (redacted)
+### Example output for `get-codex-usage` (redacted)
 
 ```json
 {
-  "ok": true,
-  "summary": {
-    "five_hour": {
-      "limit_window_seconds": 18000,
-      "reset_after_seconds": 4266,
-      "reset_at": "<redacted-unix-timestamp>",
-      "used_percent": 96
-    },
-    "seven_day": {
-      "limit_window_seconds": 604800,
-      "reset_after_seconds": 517980,
-      "reset_at": "<redacted-unix-timestamp>",
-      "used_percent": 84
+  "Usage": {
+    "AccountId": "<redacted-account-id>",
+    "PlanType": "plus",
+    "RateLimit": {
+      "Allowed": true,
+      "LimitReached": false,
+      "PrimaryWindow": {
+        "LimitWindowSeconds": 18000,
+        "ResetAfterSeconds": 4266,
+        "ResetAt": "<redacted-unix-timestamp>",
+        "UsedPercent": 96
+      },
+      "SecondaryWindow": {
+        "LimitWindowSeconds": 604800,
+        "ResetAfterSeconds": 517980,
+        "ResetAt": "<redacted-unix-timestamp>",
+        "UsedPercent": 84
+      }
     }
   },
-  "usage": {
-    "account_id": "<redacted-account-id>",
-    "additional_rate_limits": null,
-    "code_review_rate_limit": {
-      "allowed": true,
-      "limit_reached": false,
-      "primary_window": {
-        "limit_window_seconds": 604800,
-        "reset_after_seconds": 604800,
-        "reset_at": "<redacted-unix-timestamp>",
-        "used_percent": 0
-      },
-      "secondary_window": null
+  "Summary": {
+    "FiveHour": {
+      "LimitWindowSeconds": 18000,
+      "ResetAfterSeconds": 4266,
+      "ResetAt": "<redacted-unix-timestamp>",
+      "UsedPercent": 96
     },
-    "credits": {
-      "approx_cloud_messages": [0, 0],
-      "approx_local_messages": [0, 0],
-      "balance": "0",
-      "has_credits": false,
-      "unlimited": false
-    },
-    "email": "<redacted-email>",
-    "plan_type": "plus",
-    "promo": null,
-    "rate_limit": {
-      "allowed": true,
-      "limit_reached": false,
-      "primary_window": {
-        "limit_window_seconds": 18000,
-        "reset_after_seconds": 4266,
-        "reset_at": "<redacted-unix-timestamp>",
-        "used_percent": 96
-      },
-      "secondary_window": {
-        "limit_window_seconds": 604800,
-        "reset_after_seconds": 517980,
-        "reset_at": "<redacted-unix-timestamp>",
-        "used_percent": 84
-      }
-    },
-    "user_id": "<redacted-user-id>"
+    "SevenDay": {
+      "LimitWindowSeconds": 604800,
+      "ResetAfterSeconds": 517980,
+      "ResetAt": "<redacted-unix-timestamp>",
+      "UsedPercent": 84
+    }
   }
 }
 ```
 
 Summary fields
 
-For `claude`
+For `get-claude-usage`
 
-- `five_hour`
-- `seven_day`
-- `seven_day_sonnet`
+- `FiveHour`, `SevenDay`, `SevenDaySonnet`, each with `ResetsAt` and `PercentLeft` (100 minus the utilization)
 
-For `codex`
+For `get-codex-usage`
 
-- `five_hour` from `rate_limit.primary_window`
-- `seven_day` from `rate_limit.secondary_window`
+- `FiveHour` from `Usage.RateLimit.PrimaryWindow`
+- `SevenDay` from `Usage.RateLimit.SecondaryWindow`
 
 ## OpenTelemetry
 
@@ -213,7 +189,7 @@ Set `OTEL_EXPORTER_OTLP_ENDPOINT` to enable OTLP trace export. When unset, traci
 
 Trace structure per command:
 
-- `run_claude` / `run_codex` (root span)
+- `run_claude` (`get-claude-usage`) / `run_codex` (`get-codex-usage`) (root span)
   - `resolve_auth` (child span)
   - `http_request` (child span) with `http.request.method`, `url.full`, `http.response.status_code` attributes and `http.response.body` event containing the raw API response
   - `output` event containing the final JSON output
@@ -224,7 +200,7 @@ Trace structure per command:
 OTEL_EXPORTER_OTLP_ENDPOINT=https://otlp-gateway-prod-<region>.grafana.net/otlp \
 OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
 OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic <base64(instanceID:apiToken)>" \
-  nix run .#default -- claude
+  nix run .#default -- usage get-claude-usage
 ```
 
 ### Jaeger (local)
@@ -233,20 +209,22 @@ OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic <base64(instanceID:apiToken)>" \
 docker run -d -p 16686:16686 -p 4317:4317 jaegertracing/all-in-one:latest
 
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
-  nix run .#default -- claude
+  nix run .#default -- usage get-claude-usage
 ```
 
 ## Exit codes
 
 - `0`: success
-- `1`: request failure, HTTP error, JSON parse error, or runtime error
-- `2`: missing or invalid auth configuration
+- `252`: invalid command, parameter, or `--query` expression
+- `254`: the API request failed, returned a non-success HTTP status, or returned a body that is not JSON
+- `255`: missing or invalid credentials, or another runtime error
 
 ## Development checks
 
 ```bash
 nix develop -c cargo fmt -- --check
-nix develop -c cargo check
+nix develop -c cargo clippy --all-targets --all-features -- -D warnings
+nix develop -c cargo test
 ```
 
 ## Package verification
