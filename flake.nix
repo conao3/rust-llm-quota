@@ -71,6 +71,7 @@
 
           apps.default = {
             type = "app";
+            meta.description = "Print the Claude and Codex subscription usage limits";
             program = "${pkgs.lib.getExe' self'.packages.default "llm-quota"}";
           };
 
