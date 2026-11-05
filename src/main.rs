@@ -2,9 +2,8 @@ mod error;
 mod grammar;
 mod output;
 
-use clap::{Args, CommandFactory, Parser, Subcommand};
-use error::{Result, other, parameter, target};
-use grammar::{CliInputArgs, SkeletonKind};
+use clap::{CommandFactory, Parser, Subcommand};
+use error::{Result, other, target};
 use opentelemetry::trace::{Span, TraceContextExt, Tracer, get_active_span};
 use opentelemetry::{Context, KeyValue, global};
 use opentelemetry_sdk::Resource;
@@ -12,7 +11,7 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use output::{OutputFormat, Response};
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -30,14 +29,6 @@ struct Cli {
     /// Output format
     #[arg(long, global = true, help_heading = "Global Options", value_enum, default_value_t = OutputFormat::Json)]
     output: OutputFormat,
-    /// JMESPath expression applied to the output
-    #[arg(
-        long,
-        global = true,
-        help_heading = "Global Options",
-        value_name = "JMESPATH"
-    )]
-    query: Option<String>,
     /// Print the credential source and the raw response body to stderr
     #[arg(long, global = true, help_heading = "Global Options")]
     debug: bool,
@@ -67,7 +58,7 @@ Environment Variables:
   OTEL_EXPORTER_OTLP_PROTOCOL  http/protobuf or grpc [default: grpc]
   OTEL_EXPORTER_OTLP_HEADERS   Auth headers (e.g. Authorization=Basic ...)"
     )]
-    GetClaudeUsage(NoArgs),
+    GetClaudeUsage,
     /// Fetch the Codex usage limits
     #[command(
         name = "get-codex-usage",
@@ -83,13 +74,7 @@ Environment Variables:
   OTEL_EXPORTER_OTLP_PROTOCOL  http/protobuf or grpc [default: grpc]
   OTEL_EXPORTER_OTLP_HEADERS   Auth headers (e.g. Authorization=Basic ...)"
     )]
-    GetCodexUsage(NoArgs),
-}
-
-#[derive(Args)]
-struct NoArgs {
-    #[command(flatten)]
-    input: CliInputArgs,
+    GetCodexUsage,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -484,74 +469,16 @@ async fn get_codex_usage() -> Result<Value> {
     Ok(out)
 }
 
-fn output_skeleton(path: &[String]) -> Result<Value> {
-    let codex_window = || {
-        json!({
-            "LimitWindowSeconds": 0,
-            "ResetAfterSeconds": 0,
-            "ResetAt": 0,
-            "UsedPercent": 0
-        })
-    };
-    let claude_window = || ClaudeWindowSummary {
-        resets_at: Some(String::new()),
-        percent_left: Some(0.0),
-    };
-    match path.last().map(String::as_str) {
-        Some("get-claude-usage") => to_value(&UsageOutput {
-            usage: json!({}),
-            summary: ClaudeSummary {
-                five_hour: claude_window(),
-                seven_day: claude_window(),
-                seven_day_sonnet: claude_window(),
-            },
-        }),
-        Some("get-codex-usage") => to_value(&UsageOutput {
-            usage: json!({}),
-            summary: CodexSummary {
-                five_hour: codex_window(),
-                seven_day: codex_window(),
-            },
-        }),
-        _ => Err(parameter(
-            "--generate-cli-skeleton needs a command and a subcommand",
-        )),
-    }
-}
-
 async fn run() -> Result<()> {
     let mut root = Cli::command();
     root.build();
-    let prepared = grammar::prepare(&root, env::args_os().collect())?;
-    if prepared.argv.iter().any(|token| token == "--debug") {
+    let argv = grammar::prepare(&root, env::args_os().collect())?;
+    if argv.iter().any(|token| token == "--debug") {
         DEBUG.store(true, Ordering::Relaxed);
-        eprintln!("debug: argv {:?}", &prepared.argv[1..]);
+        eprintln!("debug: argv {:?}", &argv[1..]);
     }
 
-    if let Some(kind) = prepared.skeleton {
-        let mut command = &root;
-        for name in &prepared.path {
-            command = command
-                .find_subcommand(name)
-                .ok_or_else(|| other(format!("unknown subcommand {name}")))?;
-        }
-        if command.has_subcommands() {
-            return Err(parameter(
-                "--generate-cli-skeleton needs a command and a subcommand",
-            ));
-        }
-        let value = match kind {
-            SkeletonKind::Input => grammar::input_skeleton(command),
-            SkeletonKind::Output => output_skeleton(&prepared.path)?,
-        };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&value).map_err(|error| other(error.to_string()))?
-        );
-        return Ok(());
-    }
-
-    let cli = match Cli::try_parse_from(&prepared.argv) {
+    let cli = match Cli::try_parse_from(&argv) {
         Ok(cli) => cli,
         Err(error) => {
             let code = if error.use_stderr() { 252 } else { 0 };
@@ -560,21 +487,17 @@ async fn run() -> Result<()> {
         }
     };
 
-    if let Some(query) = &cli.query {
-        output::compile_query(query)?;
-    }
     let Command::Usage(command) = cli.command;
     let (name, value) = match command {
-        UsageCommand::GetClaudeUsage(_) => ("get-claude-usage", get_claude_usage().await?),
-        UsageCommand::GetCodexUsage(_) => ("get-codex-usage", get_codex_usage().await?),
+        UsageCommand::GetClaudeUsage => ("get-claude-usage", get_claude_usage().await?),
+        UsageCommand::GetCodexUsage => ("get-codex-usage", get_codex_usage().await?),
     };
     print!(
         "{}",
         output::render(
             &grammar::pascal_case(name),
             Response { value, text: None },
-            cli.output,
-            cli.query.as_deref()
+            cli.output
         )?
     );
     Ok(())
@@ -606,6 +529,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn parser_definition_is_consistent() {

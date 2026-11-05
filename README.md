@@ -26,16 +26,16 @@ nix run .#default -- usage get-claude-usage
 nix run .#default -- usage get-codex-usage
 
 # Print only the percentage left in the seven-day window
-nix run .#default -- usage get-claude-usage --query Summary.SevenDay.PercentLeft --output text
+nix run .#default -- usage get-claude-usage | jq -r .Summary.SevenDay.PercentLeft
 ```
 
 ## Command line
 
 Commands follow the AWS CLI grammar: `llm-quota [global options] <command> <subcommand> [--parameter value ...]`.
 
-- Global options: `--output json|text|table` (default `json`), `--query <JMESPath>`, `--debug` (prints the credential source and the raw response body to stderr), `--version`.
+- Global options: `--output json|text|table` (default `json`), `--debug` (prints the credential source and the raw response body to stderr), `--version`.
 - `help` works at every level: `llm-quota help`, `llm-quota usage help`, `llm-quota usage get-claude-usage help`.
-- Every subcommand accepts `--cli-input-json` (a JSON object keyed by PascalCase parameter names) and `--generate-cli-skeleton input|output`. The usage subcommands take no parameters; credentials and endpoints come from the environment variables below.
+- The usage subcommands take no parameters; credentials and endpoints come from the environment variables below.
 
 ## Authentication resolution order
 
@@ -215,7 +215,7 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
 ## Exit codes
 
 - `0`: success
-- `252`: invalid command, parameter, or `--query` expression
+- `252`: invalid command or parameter
 - `254`: the API request failed, returned a non-success HTTP status, or returned a body that is not JSON
 - `255`: missing or invalid credentials, or another runtime error
 
