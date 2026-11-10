@@ -1,3 +1,5 @@
 /target
 /result
 /.beads/daemon-error
+/.clj-kondo/
+/.lsp/
