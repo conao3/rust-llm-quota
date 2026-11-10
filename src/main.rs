@@ -1,5 +1,6 @@
 mod error;
 mod grammar;
+mod opencode;
 mod output;
 
 use clap::{CommandFactory, Parser, Subcommand};
@@ -23,7 +24,7 @@ static DEBUG: AtomicBool = AtomicBool::new(false);
 #[command(
     name = "llm-quota",
     version,
-    about = "Fetch Claude and Codex usage limits"
+    about = "Fetch Claude, Codex, and OpenCode Go usage limits"
 )]
 struct Cli {
     /// Output format
@@ -44,6 +45,7 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::enum_variant_names)]
 enum UsageCommand {
     /// Fetch the Claude OAuth usage limits
     #[command(
@@ -75,6 +77,19 @@ Environment Variables:
   OTEL_EXPORTER_OTLP_HEADERS   Auth headers (e.g. Authorization=Basic ...)"
     )]
     GetCodexUsage,
+    /// Fetch the OpenCode Go usage limits of an OpenCode Console workspace
+    #[command(
+        name = "get-opencode-usage",
+        after_help = "\
+Environment Variables:
+  OPENCODE_DB     OpenCode database (absolute, or relative to $XDG_DATA_HOME/opencode) [default: opencode.db]
+  XDG_DATA_HOME   Base of the OpenCode data directory [default: ~/.local/share]
+
+  OTEL_EXPORTER_OTLP_ENDPOINT  OTLP endpoint (enables tracing when set)
+  OTEL_EXPORTER_OTLP_PROTOCOL  http/protobuf or grpc [default: grpc]
+  OTEL_EXPORTER_OTLP_HEADERS   Auth headers (e.g. Authorization=Basic ...)"
+    )]
+    GetOpencodeUsage,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -469,6 +484,49 @@ async fn get_codex_usage() -> Result<Value> {
     Ok(out)
 }
 
+async fn get_opencode_usage() -> Result<Value> {
+    let tracer = global::tracer("llm-quota");
+    let _root_guard = Context::current_with_span(tracer.start("run_opencode")).attach();
+
+    let credential = {
+        let _auth_guard = Context::current_with_span(tracer.start("resolve_auth")).attach();
+        let db = opencode::database_path(&opencode::Environment::from_process())?;
+        if auth_debug_enabled() {
+            eprintln!("debug: opencode auth source: {}", db.display());
+        }
+        opencode::read_console_credential(&db)?
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if credential
+        .expires_at_ms
+        .is_some_and(|expires| expires <= now_ms)
+    {
+        return Err(other(format!(
+            "the OpenCode Console credential {:?} has expired (run opencode once to refresh it)",
+            credential.label
+        )));
+    }
+
+    let url = format!("{}/api/go/status", credential.server.trim_end_matches('/'));
+    let request = http_client()?
+        .get(&url)
+        .header(ACCEPT, "application/json")
+        .header(USER_AGENT, "llm-quota")
+        .header(AUTHORIZATION, format!("Bearer {}", credential.access_token))
+        .header("x-org-id", credential.org_id);
+    let usage_value = fetch_usage(request, &url).await?;
+    let summary = opencode::summarize(&usage_value)?;
+    let out = to_value(&UsageOutput {
+        usage: pascal_case_keys(usage_value),
+        summary,
+    })?;
+    record_output(&out);
+    Ok(out)
+}
+
 async fn run() -> Result<()> {
     let mut root = Cli::command();
     root.build();
@@ -491,6 +549,7 @@ async fn run() -> Result<()> {
     let (name, value) = match command {
         UsageCommand::GetClaudeUsage => ("get-claude-usage", get_claude_usage().await?),
         UsageCommand::GetCodexUsage => ("get-codex-usage", get_codex_usage().await?),
+        UsageCommand::GetOpencodeUsage => ("get-opencode-usage", get_opencode_usage().await?),
     };
     print!(
         "{}",

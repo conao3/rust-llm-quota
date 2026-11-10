@@ -1,11 +1,12 @@
 # llm-quota
 
-A CLI tool that fetches usage-limit information for Claude and Codex and prints JSON output.
+A CLI tool that fetches usage-limit information for Claude, Codex, and OpenCode Go and prints JSON output.
 
 ## Features
 
 - Fetch Claude OAuth usage with `usage get-claude-usage`
 - Fetch Codex usage with `usage get-codex-usage`
+- Fetch OpenCode Go usage with `usage get-opencode-usage`
 - Print the raw API response under `Usage` and a normalized window summary under `Summary`
 
 ## Requirements
@@ -74,6 +75,24 @@ OPENAI_OAUTH_API_KEY=your_token \
 OPENAI_ACCOUNT_ID=your_account_id \
   nix run .#default -- usage get-codex-usage
 ```
+
+### OpenCode Go
+
+`usage get-opencode-usage` reads the OpenCode Console sign-in (`opencode auth login opencode`) from the OpenCode database and asks the Console for the Go usage of that sign-in's workspace. It finds the database the way OpenCode does, so one call reads the account of the environment it runs in:
+
+1. `OPENCODE_DB` (an absolute path, or a file name in the data directory)
+2. `opencode.db` in `$XDG_DATA_HOME/opencode` (`~/.local/share/opencode`)
+
+The database is only read. When the stored access token has expired, run `opencode` once for that account so that OpenCode refreshes it.
+
+Example
+
+```bash
+OPENCODE_DB=/path/to/opencode.db \
+  nix run .#default -- usage get-opencode-usage | jq .Summary
+```
+
+`Summary` has `FiveHour`, `Week`, and `Month`, each with `ResetsAt`, `PercentLeft`, `UsedUsd`, and `LimitUsd`. `ResetsAt` is `null` while the window has not started.
 
 ## Output
 
