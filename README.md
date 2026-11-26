@@ -251,3 +251,11 @@ nix develop -c cargo test
 ```bash
 ./scripts/verify-package.sh
 ```
+
+## Release
+
+```bash
+gh workflow run release.yml --ref main -f version_bump=patch
+```
+
+The `Release` workflow bumps the version, runs the checks, pushes the version commit and the `v<version>` tag, publishes the crate to crates.io with trusted publishing, builds the binaries, and creates the GitHub Release with them. Choose `minor` or `major` for a larger bump.
