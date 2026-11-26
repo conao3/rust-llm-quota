@@ -258,4 +258,4 @@ nix develop -c cargo test
 gh workflow run release.yml --ref main -f version_bump=patch
 ```
 
-The `Release` workflow bumps the version, runs the checks, pushes the version commit and the `v<version>` tag, publishes the crate to crates.io with trusted publishing, builds the binaries, and creates the GitHub Release with them. Choose `minor` or `major` for a larger bump.
+The `Release` workflow bumps the version, verifies the crate, pushes the version commit and the `v<version>` tag, publishes the crate to crates.io with trusted publishing, builds the binaries, and creates the GitHub Release with them. Choose `minor` or `major` for a larger bump.
